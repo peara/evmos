@@ -17,6 +17,7 @@ import (
 	ethlogger "github.com/evmos/evmos/v18/x/evm/core/logger"
 	"github.com/evmos/evmos/v18/x/evm/core/vm"
 
+	rpctypes "github.com/evmos/evmos/v18/rpc/types"
 	"github.com/evmos/evmos/v18/server/config"
 	utiltx "github.com/evmos/evmos/v18/testutil/tx"
 	"github.com/evmos/evmos/v18/x/evm/statedb"
@@ -1330,10 +1331,13 @@ func (suite *KeeperTestSuite) TestEthCall() {
 	data := erc20Contract.Bin
 	data = append(data, ctorArgs...)
 
+	var stateOverride rpctypes.StateOverride
+
 	testCases := []struct {
 		name       string
 		malleate   func()
 		expVMError bool
+		vmErrorMsg string
 	}{
 		{
 			"invalid args",
@@ -1341,6 +1345,7 @@ func (suite *KeeperTestSuite) TestEthCall() {
 				req = &types.EthCallRequest{Args: []byte("invalid args"), GasCap: config.DefaultGasCap}
 			},
 			false,
+			''
 		},
 		{
 			"invalid args - specified both gasPrice and maxFeePerGas",
@@ -1356,6 +1361,7 @@ func (suite *KeeperTestSuite) TestEthCall() {
 				req = &types.EthCallRequest{Args: args, GasCap: config.DefaultGasCap}
 			},
 			false,
+			''
 		},
 		{
 			"set param AccessControl - no Access",
@@ -1400,6 +1406,44 @@ func (suite *KeeperTestSuite) TestEthCall() {
 				suite.Require().NoError(err)
 			},
 			true,
+			"does not have permission to deploy contracts"
+		},
+		{
+			"query with state override",
+			func() {
+				stateOverride = make(map[common.Address]rpctypes.OverrideAccount)
+				nonce := hexutil.Uint64(101)
+				balance := hexutil.Big(*big.NewInt(1))
+				balPtr := &balance
+				state := make(map[common.Hash]common.Hash)
+				stateOverride[common.Address{}] = rpctypes.OverrideAccount{
+					Nonce:     &nonce,
+					Code:      (*hexutil.Bytes)(&types.ERC20Contract.Bin),
+					Balance:   &balPtr,
+					State:     &state,
+					StateDiff: nil,
+				}
+
+				// selector of "totalSupply"
+				data = []byte{0xa2, 0xa9, 0x67, 0x99}
+
+				// query to zero address, which should fail unless the override code is set
+				args, err := json.Marshal(&types.TransactionArgs{
+					From: &address,
+					To:   &common.Address{},
+					Data: (*hexutil.Bytes)(&data),
+				})
+
+				suite.Require().NoError(err)
+
+				override, err := json.Marshal(stateOverride)
+				suite.Require().NoError(err)
+				req = &types.EthCallRequest{Args: args, GasCap: config.DefaultGasCap, Overrides: override}
+			},
+			true,
+			// an error is throw because we have overridden the zero address with ERC20 code
+			// TODO: make to call returns some meaningful data instead of error
+			"execution reverted"
 		},
 	}
 	for _, tc := range testCases {
@@ -1410,7 +1454,8 @@ func (suite *KeeperTestSuite) TestEthCall() {
 			res, err := suite.queryClient.EthCall(suite.ctx, req)
 			if tc.expVMError {
 				suite.Require().NotNil(res)
-				suite.Require().Contains(res.VmError, "does not have permission to deploy contracts")
+				suite.Require().Contains(res.VmError, tc.vmErrorMsg)
+				suite.Require().NoError(err)
 			} else {
 				suite.Require().Error(err)
 			}
